@@ -1,7 +1,7 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contractimpl, contracttype, Address, Env, Vec,
+    contract, contractimpl, contracttype, Address, Env, Vec, Bytes,
 };
 
 #[derive(Clone)]
@@ -10,7 +10,7 @@ pub enum DataKey {
     Admin,
     Threshold,
     Signers,
-    Next_Id,
+    NextId,
     Transaction(u64),
     Approvals(u64),
     Signer(Address),
@@ -31,7 +31,7 @@ pub struct Transaction {
     pub id: u64,
     pub to: Address,
     pub amount: i128,
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub status: TransactionStatus,
     pub proposed_by: Address,
     pub created_at: u64,
@@ -45,7 +45,8 @@ impl MultiSigContract {
     
     pub fn initialize(env: Env, admin: Address, signers: Vec<Address>, threshold: u32) {
         assert!(!env.storage().persistent().has(&DataKey::Admin), "Contract already initialized");
-        assert!(threshold > 0 && threshold as usize <= signers.len(), "Invalid threshold");
+        let signers_len: u32 = signers.len().try_into().unwrap();
+        assert!(threshold > 0 && threshold <= signers_len, "Invalid threshold");
         assert!(!signers.is_empty(), "At least one signer is required");
 
         env.storage().persistent().set(&DataKey::Admin, &admin);
@@ -53,10 +54,10 @@ impl MultiSigContract {
 
         for signer in signers.iter() {
             env.storage().persistent().set(&DataKey::Signer(signer.clone()), &true);
-            Self::update_signers_list(&env, signer, true);
+            Self::update_signers_list(&env, &signer, true);
         }
 
-        env.storage().persistent().set(&DataKey::Next_Id, &1u64);
+        env.storage().persistent().set(&DataKey::NextId, &1u64);
     }
 
     // --- Authentication helpers ---
@@ -90,8 +91,10 @@ impl MultiSigContract {
         Self::only_admin(&env, &caller);
         let threshold: u32 = env.storage().persistent().get(&DataKey::Threshold).unwrap();
         let current_signers = Self::get_signers(&env);
+        let current_len = current_signers.len() as i128;
+        let threshold_i128 = threshold as i128;
         assert!(
-            current_signers.len() > threshold as usize,
+            current_len > threshold_i128,
             "Cannot remove signer: would go below threshold"
         );
 
@@ -102,8 +105,9 @@ impl MultiSigContract {
     pub fn update_threshold(env: Env, caller: Address, new_threshold: u32) {
         Self::only_admin(&env, &caller);
         let current_signers = Self::get_signers(&env);
+        let current_len = current_signers.len() as u32;
         assert!(
-            new_threshold > 0 && new_threshold as usize <= current_signers.len(),
+            new_threshold > 0 && new_threshold <= current_len,
             "Invalid threshold"
         );
 
@@ -116,12 +120,12 @@ impl MultiSigContract {
         caller: Address,
         to: Address,
         amount: i128,
-        data: Vec<u8>,
+        data: Bytes,
     ) -> u64 {
         Self::only_signer(&env, &caller);
 
-        let tx_id: u64 = env.storage().persistent().get(&DataKey::Next_Id).unwrap();
-        env.storage().persistent().set(&DataKey::Next_Id, &(tx_id + 1));
+        let tx_id: u64 = env.storage().persistent().get(&DataKey::NextId).unwrap();
+        env.storage().persistent().set(&DataKey::NextId, &(tx_id + 1));
 
         let tx = Transaction {
             id: tx_id,
@@ -135,7 +139,6 @@ impl MultiSigContract {
 
         env.storage().persistent().set(&DataKey::Transaction(tx_id), &tx);
 
-        // First approval by proposer
         Self::self_approve(&env, &caller, tx_id);
 
         tx_id
@@ -160,20 +163,20 @@ impl MultiSigContract {
         let approvals = Self::get_approvals(&env, tx_id);
         let threshold: u32 = env.storage().persistent().get(&DataKey::Threshold).unwrap();
 
-        if approvals.len() >= threshold as usize {
+        let threshold: u32 = env.storage().persistent().get(&DataKey::Threshold).unwrap();
+        if approvals.len() as u32 >= threshold {
             Self::self_execute(&env, &mut tx);
         }
     }
 
     fn self_execute(env: &Env, tx: &mut Transaction) {
         tx.status = TransactionStatus::Executed;
-        env.storage().persistent().set(&DataKey::Transaction(tx.id), &tx);
+        // Clone the transaction to avoid mutable reference issues
+        let tx_clone = tx.clone();
+        env.storage().persistent().set(&DataKey::Transaction(tx.id), &tx_clone);
 
-        // Placeholder for actual execution logic (token transfers, etc.)
-        // Example: token::Client::new(&env, &tx.to).transfer(...);
     }
 
-    // --- Helpers ---
     pub fn get_signers(env: &Env) -> Vec<Address> {
         env.storage()
             .persistent()
@@ -193,7 +196,13 @@ impl MultiSigContract {
                 signers.push_back(signer.clone());
             }
         } else {
-            signers.retain(|s| s != signer);
+            let mut new_signers = Vec::new(env);
+            for s in signers.iter() {
+                if &s != signer {
+                    new_signers.push_back(s);
+                }
+            }
+            env.storage().persistent().set(&DataKey::Signers, &new_signers);
         }
 
         env.storage().persistent().set(&DataKey::Signers, &signers);
@@ -217,11 +226,17 @@ impl MultiSigContract {
             .get(&DataKey::Approvals(tx_id))
             .unwrap_or_else(|| Vec::new(env));
 
-        if approvals.contains(caller) {
-            return;
+        let mut found = false;
+        for addr in approvals.iter() {
+            if &addr == caller {
+                found = true;
+                break;
+            }
         }
 
-        approvals.push_back(caller.clone());
-        env.storage().persistent().set(&DataKey::Approvals(tx_id), &approvals);
+        if !found {
+            approvals.push_back(caller.clone());
+            env.storage().persistent().set(&DataKey::Approvals(tx_id), &approvals);
+        }
     }
 }
